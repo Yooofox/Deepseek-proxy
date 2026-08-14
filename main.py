@@ -16,6 +16,7 @@ import uvicorn
 
 # --- Default Global Configurations / 默认全局参数 ---
 TARGET_URL = "https://api.deepseek.com"
+MODELS_URL = ""  # Fallback to TARGET_URL if empty / 留空则默认与 TARGET_URL 一致
 TARGET_CONTEXT_WINDOW = 65536  # 64k
 PORT = 2345
 
@@ -33,7 +34,6 @@ class GUILogger:
         self.enabled_var = enabled_var
 
     def log(self, level: str, message: str):
-        # Check if logging is enabled / 检查日志开关
         if self.enabled_var and not self.enabled_var.get():
             return
 
@@ -46,7 +46,6 @@ class GUILogger:
 
     def _append_text(self, text):
         try:
-            # Prevent lag: limit max line count / 防卡顿：控制最大行数
             if self.current_line_count >= self.max_lines:
                 self.text_widget.delete("1.0", "200.0")
                 self.current_line_count -= 200
@@ -81,6 +80,29 @@ def get_client():
     return client
 
 
+def build_target_url(base_url: str, endpoint_path: str) -> str:
+    """
+    Intelligently splice target base URL with endpoint path.
+    智能拼接基础 URL 与目标端点路径，防止出现重复或缺失的 /v1/ /v2/ 前缀
+    """
+    base = base_url.strip().rstrip("/")
+    endpoint = endpoint_path.strip().lstrip("/")
+
+    # If endpoint starts with v1/, strip it for checking / 剥离相对路径前缀
+    clean_endpoint = endpoint[3:] if endpoint.startswith("v1/") else endpoint
+
+    # 1. Base URL already ends with exact endpoint / 基础地址已直接包含该端点
+    if base.endswith("/" + clean_endpoint) or base.endswith(clean_endpoint):
+        return base
+
+    # 2. Base URL contains custom version path (e.g. /v2 or /tokenplan) / 包含自定义路径（如千帆 v2）
+    if "/v1" in base or "/v2" in base or "tokenplan" in base:
+        return f"{base}/{clean_endpoint}"
+
+    # 3. Standard OpenAI path fallback / 标准 OpenAI /v1/ 拼接
+    return f"{base}/v1/{clean_endpoint}"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     gui_logger.log("INFO", f"Proxy Service Started - Listening on http://127.0.0.1:{PORT}")
@@ -96,19 +118,25 @@ app = FastAPI(lifespan=lifespan)
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def proxy(request: Request, path: str):
-    global TARGET_URL, TARGET_CONTEXT_WINDOW
-
-    # Auto-fix route prefix / 路径格式标准化
-    if not path.startswith("v1/") and path != "v1":
-        real_path = f"v1/{path}"
-    else:
-        real_path = path
+    global TARGET_URL, MODELS_URL, TARGET_CONTEXT_WINDOW
 
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None)
 
     body = await request.body()
+    is_models_request = path.endswith("models")
+
+    # --- 1. Reroute Logic / 智能路由分流判断 ---
+    if is_models_request:
+        models_base = MODELS_URL if MODELS_URL else TARGET_URL
+        url = build_target_url(models_base, "models")
+    else:
+        # Determine real endpoint path
+        real_endpoint = "chat/completions" if path.endswith("responses") else path
+        url = build_target_url(TARGET_URL, real_endpoint)
+
+    gui_logger.log("INFO", f"--> {request.method} /{path} -> {url}")
 
     if request.method == "POST" and "application/json" in headers.get("content-type", "").lower():
         try:
@@ -121,11 +149,9 @@ async def proxy(request: Request, path: str):
 
             body_json = json.loads(body_str)
 
-            # --- 1. Reroute /responses to /v1/chat/completions / 重定向 /responses 接口 ---
-            if real_path.endswith("responses"):
-                real_path = "v1/chat/completions"
-                gui_logger.log("DEBUG", "  [REROUTE] Mapped /responses -> /v1/chat/completions")
-
+            # Map /responses -> /chat/completions payload format / 转换 /responses 载荷
+            if path.endswith("responses"):
+                gui_logger.log("DEBUG", "  [REROUTE] Mapped /responses -> /chat/completions")
                 messages = []
                 if "instructions" in body_json and body_json["instructions"]:
                     messages.append({"role": "system", "content": body_json.pop("instructions")})
@@ -139,7 +165,7 @@ async def proxy(request: Request, path: str):
                 if "messages" not in body_json or not body_json["messages"]:
                     body_json["messages"] = messages
 
-            # --- 2. Clean unsupported OpenAI parameters / 清洗 DeepSeek 不支持的参数 ---
+            # Clean unsupported parameters / 清洗不兼容字段
             unsupported_keys = [
                 "reasoning_effort",
                 "stream_options",
@@ -149,11 +175,7 @@ async def proxy(request: Request, path: str):
                 "modalities",
                 "audio"
             ]
-            cleaned_keys = []
-            for key in unsupported_keys:
-                if key in body_json:
-                    del body_json[key]
-                    cleaned_keys.append(key)
+            cleaned_keys = [key for key in unsupported_keys if body_json.pop(key, None) is not None]
 
             if cleaned_keys:
                 gui_logger.log("DEBUG", f"  [CLEAN] Removed unsupported keys: {cleaned_keys}")
@@ -165,9 +187,6 @@ async def proxy(request: Request, path: str):
             body = json.dumps(body_json).encode("utf-8")
         except Exception as e:
             gui_logger.log("ERROR", f"  [WARN] Request body parse/adapt failed: {e}")
-
-    url = f"{TARGET_URL}/{real_path}"
-    gui_logger.log("INFO", f"--> {request.method} /{path} -> /{real_path}")
 
     cli = get_client()
     req = cli.build_request(
@@ -190,7 +209,7 @@ async def proxy(request: Request, path: str):
     gui_logger.log("INFO", f"<-- Status {res.status_code} for /{path}")
 
     # Inject context window for models endpoint / 特殊处理 models 接口注入上下文上限
-    if real_path.endswith("models") and res.status_code == 200:
+    if is_models_request and res.status_code == 200:
         await res.aread()
         try:
             models_data = res.json()
@@ -269,11 +288,11 @@ def _do_restart():
 
 
 def main():
-    global TARGET_URL, PORT, TARGET_CONTEXT_WINDOW
+    global TARGET_URL, MODELS_URL, PORT, TARGET_CONTEXT_WINDOW
 
     root = tk.Tk()
     root.title("API Local Proxy Control Panel")
-    root.geometry("860x600")
+    root.geometry("880x640")
     root.configure(bg="#f5f5f5")
 
     # 1. Header Bar / 顶部标题栏
@@ -299,21 +318,30 @@ def main():
     )
     config_frame.pack(fill=tk.X, padx=8, pady=6)
 
-    # Line 1: Target URL Entry / 目标网址
+    # Line 1: Chat API URL Entry / 对话接口网址
     f_url = tk.Frame(config_frame, bg="#f5f5f5")
     f_url.pack(fill=tk.X, pady=2)
-    lbl_url = tk.Label(f_url, text="Target API URL / 目标网址:", width=22, anchor="w", bg="#f5f5f5",
-                       font=("Segoe UI", 9))
+    lbl_url = tk.Label(f_url, text="Chat API URL / 对话网址:", width=26, anchor="w", bg="#f5f5f5", font=("Segoe UI", 9))
     lbl_url.pack(side=tk.LEFT)
     url_var = tk.StringVar(value=TARGET_URL)
     ent_url = tk.Entry(f_url, textvariable=url_var, font=("Consolas", 9))
     ent_url.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-    # Line 2: Port & Context Window / 端口与上下文大小
+    # Line 2: Models API URL Entry / 模型获取网址
+    f_murl = tk.Frame(config_frame, bg="#f5f5f5")
+    f_murl.pack(fill=tk.X, pady=2)
+    lbl_murl = tk.Label(f_murl, text="Models API URL / 模型网址(可选):", width=26, anchor="w", bg="#f5f5f5",
+                        font=("Segoe UI", 9))
+    lbl_murl.pack(side=tk.LEFT)
+    models_url_var = tk.StringVar(value=MODELS_URL)
+    ent_murl = tk.Entry(f_murl, textvariable=models_url_var, font=("Consolas", 9))
+    ent_murl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    # Line 3: Port & Context Window / 端口与上下文大小
     f_num = tk.Frame(config_frame, bg="#f5f5f5")
     f_num.pack(fill=tk.X, pady=2)
 
-    lbl_port = tk.Label(f_num, text="Port / 端口:", width=22, anchor="w", bg="#f5f5f5", font=("Segoe UI", 9))
+    lbl_port = tk.Label(f_num, text="Port / 端口:", width=26, anchor="w", bg="#f5f5f5", font=("Segoe UI", 9))
     lbl_port.pack(side=tk.LEFT)
     port_var = tk.StringVar(value=str(PORT))
     ent_port = tk.Entry(f_num, textvariable=port_var, width=10, font=("Consolas", 9))
@@ -339,17 +367,22 @@ def main():
     )
     chk_enable.pack(side=tk.LEFT)
 
-    # Save & Restart Callback / 保存参数并重启逻辑
     def apply_config_and_restart():
-        global TARGET_URL, PORT, TARGET_CONTEXT_WINDOW
+        global TARGET_URL, MODELS_URL, PORT, TARGET_CONTEXT_WINDOW
 
         new_url = url_var.get().strip().rstrip("/")
+        new_models_url = models_url_var.get().strip().rstrip("/")
         new_port_str = port_var.get().strip()
         new_ctx_str = ctx_var.get().strip()
 
         if not new_url.startswith(("http://", "https://")):
             messagebox.showerror("Error / 错误",
-                                 "Target URL must start with http:// or https://\n目标 URL 必须以 http:// 或 https:// 开头")
+                                 "Chat API URL must start with http:// or https://\n对话 URL 必须以 http:// 或 https:// 开头")
+            return
+
+        if new_models_url and not new_models_url.startswith(("http://", "https://")):
+            messagebox.showerror("Error / 错误",
+                                 "Models API URL must start with http:// or https://\n模型 URL 必须以 http:// 或 https:// 开头")
             return
 
         try:
@@ -362,14 +395,15 @@ def main():
 
         # Update Globals / 更新全局变量
         TARGET_URL = new_url
+        MODELS_URL = new_models_url
         PORT = new_port
         TARGET_CONTEXT_WINDOW = new_ctx
 
         # Update Header Display / 更新标题栏展示
         title_label.config(text=f"API Local Proxy | Endpoint: http://127.0.0.1:{PORT}/v1")
-        gui_logger.log("INFO", f"Saved Config -> URL: {TARGET_URL} | Port: {PORT} | Context: {TARGET_CONTEXT_WINDOW}")
+        gui_logger.log("INFO",
+                       f"Saved Config -> Chat: {TARGET_URL} | Models: {MODELS_URL or 'Same as Chat'} | Port: {PORT}")
 
-        # Restart Proxy / 重启服务
         restart_server()
 
     btn_apply = tk.Button(
